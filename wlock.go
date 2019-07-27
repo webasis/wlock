@@ -1,6 +1,7 @@
 package wlock
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 
@@ -17,9 +18,8 @@ type Locker struct {
 }
 
 type Status struct {
-	Total    int
-	Locked   int
-	Unlocked int
+	Total  int `json:"total"`
+	Locked int `json:"locked"`
 }
 
 type LMFunc func(lm *LockerManager)
@@ -136,16 +136,13 @@ func (lm *LockerManager) Unlock(id string, token string) bool {
 
 func (lm *LockerManager) Status() Status {
 	s := Status{
-		Total:    len(lm.Lockers),
-		Locked:   0,
-		Unlocked: 0,
+		Total:  len(lm.Lockers),
+		Locked: 0,
 	}
 
 	for _, l := range lm.Lockers {
 		if l.Locked {
 			s.Locked++
-		} else {
-			s.Unlocked++
 		}
 	}
 
@@ -221,5 +218,19 @@ func Enable(rpc *wrpc.Server, lm *LockerManager) {
 		} else {
 			return wret.Error()
 		}
+	})
+
+	rpc.HandleFunc("wlock/status", func(r wrpc.Req) wrpc.Resp {
+		var s Status
+		lm.Sync(func() {
+			s = lm.Status()
+		})
+
+		raw, err := json.Marshal(s)
+		if err != nil {
+			return wret.IError(err.Error())
+		}
+
+		return wret.OK(string(raw))
 	})
 }
