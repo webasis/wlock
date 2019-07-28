@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/webasis/wrpc"
@@ -15,6 +16,9 @@ type Locker struct {
 	Secret string // update while new/free
 	Token  string // update while lock/unlock
 	Locked bool
+
+	LastHold  time.Time // for auto free
+	LastTouch time.Time // for auto unlock
 }
 
 type Status struct {
@@ -30,8 +34,11 @@ type LockerManager struct {
 	Lockers map[string]*Locker // map[id]
 
 	// read-only
-	NextId     func() string
-	NextSecret func() string
+	NextId             func() string
+	NextSecret         func() string
+	AutoFreeInterval   time.Duration
+	AutoUnlockInterval time.Duration
+	GCInterval         time.Duration
 }
 
 func DefaultNextId() func() string {
@@ -57,8 +64,11 @@ func New() *LockerManager {
 		C:       make(chan LMFunc, DEFAULT_SIZE),
 		Lockers: make(map[string]*Locker),
 
-		NextId:     DefaultNextId(),
-		NextSecret: DefaultNextSecret,
+		NextId:             DefaultNextId(),
+		NextSecret:         DefaultNextSecret,
+		AutoFreeInterval:   time.Second * 300,
+		AutoUnlockInterval: time.Second * 60,
+		GCInterval:         time.Second * 600,
 	}
 
 	go lm.loop()
@@ -66,19 +76,45 @@ func New() *LockerManager {
 }
 
 func (lm *LockerManager) loop() {
+	// gc
+	go func() {
+		for {
+			time.Sleep(lm.GCInterval)
+			lm.C <- func(lm *LockerManager) {
+				lm.GC()
+			}
+		}
+	}()
+
 	for fn := range lm.C {
 		fn(lm)
+	}
+}
+
+func (lm *LockerManager) GC() {
+	for id, l := range lm.Lockers {
+		if time.Now().Sub(l.LastHold) > lm.AutoFreeInterval {
+			lm.Free(id, l.Secret)
+			continue
+		}
+		if l.Locked && time.Now().Sub(l.LastTouch) > lm.AutoUnlockInterval {
+			lm.Unlock(id, l.Token)
+			continue
+		}
 	}
 }
 
 func (lm *LockerManager) New() (id string, secret string) {
 	id = lm.NextId()
 	secret = lm.NextSecret()
+	now := time.Now()
 	l := &Locker{
-		Id:     id,
-		Secret: secret,
-		Token:  "",
-		Locked: false,
+		Id:        id,
+		Secret:    secret,
+		Token:     "",
+		Locked:    false,
+		LastHold:  now,
+		LastTouch: now,
 	}
 
 	lm.Lockers[id] = l
@@ -99,10 +135,29 @@ func (lm *LockerManager) Free(id string, secret string) bool {
 	return true
 }
 
+func (lm *LockerManager) Hold(id string, secret string) bool {
+	l := lm.Lockers[id]
+	if l == nil {
+		return false
+	}
+
+	if l.Secret != secret {
+		return false
+	}
+
+	l.LastHold = time.Now()
+	return true
+}
+
 func (lm *LockerManager) Lock(id string) (token string) {
 	l := lm.Lockers[id]
 	if l == nil {
 		return ""
+	}
+
+	// auto unlock
+	if time.Now().Sub(l.LastTouch) > lm.AutoUnlockInterval {
+		lm.Unlock(id, l.Token)
 	}
 
 	if l.Locked == true {
@@ -111,7 +166,7 @@ func (lm *LockerManager) Lock(id string) (token string) {
 	token = lm.NextSecret()
 	l.Token = token
 	l.Locked = true
-
+	l.LastTouch = time.Now()
 	return token
 }
 
@@ -130,8 +185,26 @@ func (lm *LockerManager) Unlock(id string, token string) bool {
 	}
 
 	l.Locked = false
+	l.Token = ""
 	return true
+}
 
+func (lm *LockerManager) Touch(id string, token string) bool {
+	l := lm.Lockers[id]
+	if l == nil {
+		return false
+	}
+
+	if l.Locked == false {
+		return false
+	}
+
+	if l.Token != token {
+		return false
+	}
+
+	l.LastTouch = time.Now()
+	return true
 }
 
 func (lm *LockerManager) Status() Status {
@@ -184,6 +257,47 @@ func Enable(rpc *wrpc.Server, lm *LockerManager) {
 			return wret.Error()
 		}
 	})
+	rpc.HandleFunc("wlock/renew", func(r wrpc.Req) wrpc.Resp {
+		if len(r.Args) != 2 {
+			return wret.Error("args")
+		}
+
+		id := r.Args[0]
+		secret := r.Args[1]
+		var ok bool
+		lm.Sync(func() {
+			ok = lm.Hold(id, secret)
+		})
+
+		if ok {
+			return wret.OK()
+		} else {
+			return wret.Error()
+		}
+	})
+	rpc.HandleFunc("wlock/status", func(r wrpc.Req) wrpc.Resp {
+		if len(r.Args) != 1 {
+			return wret.Error("args")
+		}
+
+		var status string
+		id := r.Args[0]
+		lm.Sync(func() {
+			l := lm.Lockers[id]
+			if l == nil {
+				status = "not_found"
+				return
+			}
+
+			if l.Locked {
+				status = "locked"
+			} else {
+				status = "unlocked"
+			}
+		})
+
+		return wret.OK(status)
+	})
 	rpc.HandleFunc("wlock/lock", func(r wrpc.Req) wrpc.Resp {
 		if len(r.Args) != 1 {
 			return wret.Error("args")
@@ -220,7 +334,26 @@ func Enable(rpc *wrpc.Server, lm *LockerManager) {
 		}
 	})
 
-	rpc.HandleFunc("wlock/status", func(r wrpc.Req) wrpc.Resp {
+	rpc.HandleFunc("wlock/touch", func(r wrpc.Req) wrpc.Resp {
+		if len(r.Args) != 2 {
+			return wret.Error("args")
+		}
+
+		id := r.Args[0]
+		token := r.Args[1]
+		var ok bool
+		lm.Sync(func() {
+			ok = lm.Touch(id, token)
+		})
+
+		if ok {
+			return wret.OK()
+		} else {
+			return wret.Error()
+		}
+	})
+
+	rpc.HandleFunc("wlock/admin/status", func(r wrpc.Req) wrpc.Resp {
 		var s Status
 		lm.Sync(func() {
 			s = lm.Status()
