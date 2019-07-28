@@ -91,16 +91,20 @@ func (lm *LockerManager) loop() {
 	}
 }
 
+func (lm *LockerManager) gc(l *Locker) {
+	if time.Now().Sub(l.LastHold) > lm.AutoFreeInterval {
+		lm.Free(l.Id, l.Secret)
+		return
+	}
+	if l.Locked && time.Now().Sub(l.LastTouch) > lm.AutoUnlockInterval {
+		lm.Unlock(l.Id, l.Token)
+		return
+	}
+}
+
 func (lm *LockerManager) GC() {
-	for id, l := range lm.Lockers {
-		if time.Now().Sub(l.LastHold) > lm.AutoFreeInterval {
-			lm.Free(id, l.Secret)
-			continue
-		}
-		if l.Locked && time.Now().Sub(l.LastTouch) > lm.AutoUnlockInterval {
-			lm.Unlock(id, l.Token)
-			continue
-		}
+	for _, l := range lm.Lockers {
+		lm.gc(l)
 	}
 }
 
@@ -155,10 +159,7 @@ func (lm *LockerManager) Lock(id string) (token string) {
 		return ""
 	}
 
-	// auto unlock
-	if time.Now().Sub(l.LastTouch) > lm.AutoUnlockInterval {
-		lm.Unlock(id, l.Token)
-	}
+	lm.gc(l)
 
 	if l.Locked == true {
 		return ""
@@ -284,11 +285,15 @@ func Enable(rpc *wrpc.Server, lm *LockerManager) {
 		id := r.Args[0]
 		lm.Sync(func() {
 			l := lm.Lockers[id]
+			if l != nil {
+				lm.gc(l)
+				l = lm.Lockers[id]
+			}
+
 			if l == nil {
 				status = "not_found"
 				return
 			}
-
 			if l.Locked {
 				status = "locked"
 			} else {
